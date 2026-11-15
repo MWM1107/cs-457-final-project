@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-CS 457 Final Project - Sprint 3: Yahtzee CLI Client
+CS 457 Final Project - Sprint 5: Yahtzee CLI Client
 Implements DNS resolution with graceful socket.gaierror handling, 4-byte
-Big-Endian length-prefixed framing, and an interactive CLI interface.
+Big-Endian framing, and Stateful Reconnection (STATE_RESUME).
 """
 
 import argparse
@@ -20,7 +20,7 @@ CATEGORIES = [
 
 
 # ---------------------------------------------------------------------------
-# Framing & Socket Helpers (Sprint 1 Blueprint)
+# Framing & Socket Helpers
 # ---------------------------------------------------------------------------
 
 def recv_exact(sock, n_bytes):
@@ -63,7 +63,11 @@ def render_board(player_id, msg):
     rolls_left = msg.get("rolls_remaining")
     dice = msg.get("current_dice", [])
     scores = msg.get("scores", {})
+    status_msg = msg.get("status_message")
     players = list(scores.keys())
+
+    if status_msg:
+        print(f"\n[STATUS] {status_msg}")
 
     print("\n" + "=" * 58)
     print("                 YAHTZEE SCOREBOARD")
@@ -119,6 +123,9 @@ def listen_to_server(sock, player_id, stop_event):
                 roles = msg.get("roles", {})
                 first = msg.get("first_turn")
                 print(f"\n[GAME START] Match initiated! Roles: {roles}. First turn: {first}")
+            elif msg_type == "STATE_RESUME":
+                print("\n[STATE_RESUME] Session restored! Resuming match without state loss.")
+                render_board(player_id, msg)
             elif msg_type == "STATE_UPDATE":
                 render_board(player_id, msg)
             elif msg_type == "ERROR":
@@ -178,7 +185,6 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Mandatory Requirement 2.2: Graceful DNS Resolution Exception Handling
     try:
         server_ip = socket.gethostbyname(args.hostname)
     except socket.gaierror:
@@ -199,7 +205,6 @@ def main():
 
     print(f"[CONNECTED] Connected to {args.hostname} ({server_ip}:{args.port}) as '{player_id}'.")
 
-    # Send initial CONNECT message
     send_msg(sock, {
         "msg_type": "CONNECT",
         "player_id": player_id
@@ -213,7 +218,6 @@ def main():
     )
     listener.start()
 
-    # Main user input loop
     try:
         while not stop_event.is_set():
             user_input = input()
@@ -281,11 +285,14 @@ def main():
                 print("> ", end="", flush=True)
 
     except (KeyboardInterrupt, EOFError):
+        print("\n[CLIENT] Simulating abrupt disconnect (TCP RST)...")
         try:
-            send_msg(sock, {
-                "msg_type": "DISCONNECT",
-                "player_id": player_id
-            })
+            # Force a TCP RST packet so the server catches ConnectionResetError
+            sock.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_LINGER,
+                struct.pack("ii", 1, 0)
+            )
         except OSError:
             pass
     except (ConnectionResetError, BrokenPipeError, OSError):

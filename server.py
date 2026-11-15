@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-CS 457 Final Project - Sprint 3: Yahtzee Authoritative Game Server
-Implements 4-byte Big-Endian length-prefixed framing, multi-threaded client
-handling, thread-safe state synchronization, and the Yahtzee Game FSM.
+CS 457 Final Project - Sprint 5: Yahtzee Authoritative Game Server
+Implements 4-byte Big-Endian framing, multi-threaded client handling,
+and Stateful Disconnect & Reconnect Recovery (60s grace period + STATE_RESUME).
 """
 
 import argparse
@@ -11,7 +11,6 @@ import json
 import random
 import socket
 import struct
-import sys
 import threading
 
 VALID_CATEGORIES = [
@@ -20,11 +19,12 @@ VALID_CATEGORIES = [
     "small_straight", "large_straight", "yahtzee", "chance"
 ]
 
-MAX_ROUNDS = 13  # 13 categories per player
+MAX_ROUNDS = 13
+RECONNECT_GRACE_SECONDS = 60
 
 
 # ---------------------------------------------------------------------------
-# Framing & Socket Helpers (Sprint 1 Blueprint)
+# Framing & Socket Helpers
 # ---------------------------------------------------------------------------
 
 def recv_exact(sock, n_bytes):
@@ -33,7 +33,7 @@ def recv_exact(sock, n_bytes):
     while len(buf) < n_bytes:
         chunk = sock.recv(n_bytes - len(buf))
         if not chunk:
-            return None  # POSIX 0-byte EOF
+            return None
         buf.extend(chunk)
     return bytes(buf)
 
@@ -93,26 +93,31 @@ def calculate_category_score(category, dice):
 
 
 # ---------------------------------------------------------------------------
-# Game State & Server Concurrency Manager (Sprint 2 Architecture)
+# Game State & Server Concurrency Manager
 # ---------------------------------------------------------------------------
 
 class YahtzeeServer:
-    """Manages the FSM, thread lock, and connected clients for 2-player Yahtzee."""
+    """Manages the FSM, thread lock, and stateful reconnection for Yahtzee."""
 
     def __init__(self, port):
         self.port = port
         self.state = "INIT"
         self.game_state_lock = threading.Lock()
+        self.reconnect_timers = {}
         self.reset_game_state()
 
     def reset_game_state(self):
         """Initialize or reset the game state for a new match."""
-        self.client_sockets = {}   # player_id -> socket
-        self.player_order = []     # [player1_id, player2_id]
+        for timer in self.reconnect_timers.values():
+            timer.cancel()
+        self.reconnect_timers = {}
+        self.disconnected_players = set()
+        self.client_sockets = {}
+        self.player_order = []
         self.active_turn = None
         self.current_dice = [1, 1, 1, 1, 1]
         self.rolls_remaining = 2
-        self.scorecards = {}       # player_id -> {category: score, "total": int}
+        self.scorecards = {}
         self.state = "WAITING_FOR_PLAYERS"
         print(f"[FSM] State -> {self.state}")
 
@@ -122,28 +127,32 @@ class YahtzeeServer:
         self.rolls_remaining = 2
 
     def broadcast(self, msg_dict):
-        """Send a JSON message to all connected clients (caller holds lock)."""
+        """Send a JSON message to all currently connected clients (caller holds lock)."""
         for pid, sock in list(self.client_sockets.items()):
+            if pid in self.disconnected_players or sock is None:
+                continue
             try:
                 send_msg(sock, msg_dict)
             except (ConnectionResetError, BrokenPipeError, OSError) as exc:
                 print(f"[WARN] Failed to broadcast to {pid}: {exc}")
 
-    def build_state_update(self):
-        """Build the STATE_UPDATE payload matching Sprint 1 schema."""
-        return {
+    def build_state_update(self, status_message=None):
+        """Build the STATE_UPDATE payload."""
+        payload = {
             "msg_type": "STATE_UPDATE",
             "active_player": self.active_turn,
             "rolls_remaining": self.rolls_remaining,
             "current_dice": self.current_dice,
             "scores": self.scorecards
         }
+        if status_message:
+            payload["status_message"] = status_message
+        return payload
 
     def handle_client(self, client_sock, addr):
         """Dedicated worker thread servicing a single client connection."""
         player_id = None
         try:
-            # 1. Expect initial CONNECT message
             msg = recv_msg(client_sock)
             if not msg or msg.get("msg_type") != "CONNECT":
                 send_msg(client_sock, {
@@ -157,62 +166,88 @@ class YahtzeeServer:
             requested_id = str(msg.get("player_id", "Player")).strip() or "Player"
 
             with self.game_state_lock:
-                if len(self.player_order) >= 2:
-                    send_msg(client_sock, {
-                        "msg_type": "ERROR",
-                        "error_code": "ROOM_FULL",
-                        "message": "Game room is already full."
-                    })
-                    client_sock.close()
-                    return
+                # Check if this is a returning player reconnecting within the grace period
+                if requested_id in self.disconnected_players:
+                    player_id = requested_id
+                    self.disconnected_players.remove(player_id)
+                    if player_id in self.reconnect_timers:
+                        self.reconnect_timers.pop(player_id).cancel()
 
-                # Prevent duplicate player aliases
-                player_id = requested_id
-                if player_id in self.client_sockets:
-                    player_id = f"{requested_id}_2"
+                    self.client_sockets[player_id] = client_sock
+                    print(f"[RECONNECT] Player '{player_id}' reconnected from {addr}!")
+                    print(f"[RECONNECT] Re-binding socket and restoring preserved game state.")
 
-                self.client_sockets[player_id] = client_sock
-                self.player_order.append(player_id)
-                self.scorecards[player_id] = {"total": 0}
-                print(f"[INFO] Player '{player_id}' connected from {addr}.")
+                    if not self.disconnected_players:
+                        self.state = "PLAYER_TURN"
+                        print(f"[FSM] State -> {self.state} (Active: {self.active_turn})")
 
-                if len(self.player_order) == 1:
-                    self.state = "LOBBY_WAIT"
-                    print(f"[FSM] State -> {self.state}")
-                    send_msg(client_sock, {
-                        "msg_type": "LOBBY_WAIT",
-                        "message": "Waiting for opponent..."
-                    })
-                elif len(self.player_order) == 2:
-                    self.state = "GAME_START"
-                    print(f"[FSM] State -> {self.state}")
-                    p1, p2 = self.player_order[0], self.player_order[1]
-                    self.active_turn = p1
-                    self.roll_new_turn_dice()
+                    resume_msg = {
+                        "msg_type": "STATE_RESUME",
+                        "reconnected_player": player_id,
+                        "status_message": f"Player '{player_id}' reconnected! Game resumed without state loss.",
+                        "active_player": self.active_turn,
+                        "rolls_remaining": self.rolls_remaining,
+                        "current_dice": self.current_dice,
+                        "scores": self.scorecards
+                    }
+                    self.broadcast(resume_msg)
 
-                    self.broadcast({
-                        "msg_type": "GAME_START",
-                        "roles": {p1: "Player_1", p2: "Player_2"},
-                        "first_turn": p1
-                    })
+                else:
+                    # Standard initial connection
+                    if len(self.player_order) >= 2:
+                        send_msg(client_sock, {
+                            "msg_type": "ERROR",
+                            "error_code": "ROOM_FULL",
+                            "message": "Game room is already full."
+                        })
+                        client_sock.close()
+                        return
 
-                    self.state = "PLAYER_TURN"
-                    print(f"[FSM] State -> {self.state} (Active: {self.active_turn})")
-                    self.broadcast(self.build_state_update())
+                    player_id = requested_id
+                    if player_id in self.client_sockets:
+                        player_id = f"{requested_id}_2"
 
-            # 2. Main Client Servicing Loop
+                    self.client_sockets[player_id] = client_sock
+                    self.player_order.append(player_id)
+                    self.scorecards[player_id] = {"total": 0}
+                    print(f"[INFO] Player '{player_id}' connected from {addr}.")
+
+                    if len(self.player_order) == 1:
+                        self.state = "LOBBY_WAIT"
+                        print(f"[FSM] State -> {self.state}")
+                        send_msg(client_sock, {
+                            "msg_type": "LOBBY_WAIT",
+                            "message": "Waiting for opponent..."
+                        })
+                    elif len(self.player_order) == 2:
+                        self.state = "GAME_START"
+                        print(f"[FSM] State -> {self.state}")
+                        p1, p2 = self.player_order[0], self.player_order[1]
+                        self.active_turn = p1
+                        self.roll_new_turn_dice()
+
+                        self.broadcast({
+                            "msg_type": "GAME_START",
+                            "roles": {p1: "Player_1", p2: "Player_2"},
+                            "first_turn": p1
+                        })
+
+                        self.state = "PLAYER_TURN"
+                        print(f"[FSM] State -> {self.state} (Active: {self.active_turn})")
+                        self.broadcast(self.build_state_update())
+
+            # Main Client Servicing Loop
             while True:
                 msg = recv_msg(client_sock)
                 if msg is None:
-                    # 0-byte EOF detected
-                    print(f"[INFO] EOF (0 bytes) received from '{player_id}'.")
-                    self.handle_disconnect(player_id)
+                    print(f"[WARN] ConnectionResetError / EOF detected from '{player_id}'.")
+                    self.handle_abrupt_disconnect(player_id, client_sock)
                     break
 
                 msg_type = msg.get("msg_type")
                 if msg_type == "DISCONNECT":
-                    print(f"[INFO] DISCONNECT received from '{player_id}'.")
-                    self.handle_disconnect(player_id)
+                    print(f"[INFO] Explicit DISCONNECT received from '{player_id}'.")
+                    self.handle_forfeit(player_id)
                     break
                 elif msg_type == "MOVE":
                     self.process_move(player_id, client_sock, msg)
@@ -224,18 +259,26 @@ class YahtzeeServer:
                             "message": f"Unsupported msg_type: {msg_type}"
                         })
 
-        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError) as exc:
-            print(f"[WARN] Abrupt connection drop for '{player_id}': {exc}")
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError) as exc:
+            print(f"[WARN] ConnectionResetError caught for '{player_id}': {exc}")
             if player_id:
-                self.handle_disconnect(player_id)
+                self.handle_abrupt_disconnect(player_id, client_sock)
         except json.JSONDecodeError:
             print(f"[WARN] Malformed JSON received from '{player_id}'.")
             if player_id:
-                self.handle_disconnect(player_id)
+                self.handle_abrupt_disconnect(player_id, client_sock)
 
     def process_move(self, player_id, client_sock, msg):
         """Thread-safe evaluation of a client MOVE message."""
         with self.game_state_lock:
+            if self.state == "TEMPORARILY_DISCONNECTED":
+                send_msg(client_sock, {
+                    "msg_type": "ERROR",
+                    "error_code": "OPPONENT_DISCONNECTED",
+                    "message": "Opponent is temporarily disconnected. Waiting for reconnect..."
+                })
+                return
+
             if self.state != "PLAYER_TURN":
                 send_msg(client_sock, {
                     "msg_type": "ERROR",
@@ -247,7 +290,6 @@ class YahtzeeServer:
             self.state = "EVALUATE_MOVE"
             print(f"[FSM] State -> {self.state} (From: {player_id})")
 
-            # Turn enforcement check
             if player_id != self.active_turn:
                 self.state = "PLAYER_TURN"
                 send_msg(client_sock, {
@@ -269,7 +311,6 @@ class YahtzeeServer:
 
             action = payload.get("action")
 
-            # Action 1: Hold / Reroll Dice
             if action in ("hold", "roll"):
                 if self.rolls_remaining <= 0:
                     self.state = "PLAYER_TURN"
@@ -303,7 +344,6 @@ class YahtzeeServer:
                 self.state = "PLAYER_TURN"
                 print(f"[FSM] State -> {self.state} (Active: {self.active_turn})")
 
-            # Action 2: Score a Category
             elif action == "score":
                 category = str(payload.get("category", "")).lower().strip()
                 if category not in VALID_CATEGORIES:
@@ -334,7 +374,6 @@ class YahtzeeServer:
                 self.state = "CHECK_WIN_DRAW"
                 print(f"[FSM] State -> {self.state}")
 
-                # Check if both players have filled all 13 categories (+1 for "total" key)
                 all_done = all(
                     len(card) >= MAX_ROUNDS + 1 for card in self.scorecards.values()
                 )
@@ -361,7 +400,6 @@ class YahtzeeServer:
                     })
                     self.cleanup_session()
                 else:
-                    # Switch active player for next turn
                     p1, p2 = self.player_order[0], self.player_order[1]
                     self.active_turn = p2 if self.active_turn == p1 else p1
                     self.roll_new_turn_dice()
@@ -377,54 +415,98 @@ class YahtzeeServer:
                     "message": "Action must be 'hold', 'roll', or 'score'."
                 })
 
-    def handle_disconnect(self, disconnected_player):
-        """Handle graceful or abrupt client disconnect and declare forfeit if in-game."""
+    def handle_abrupt_disconnect(self, disconnected_player, dead_sock):
+        """Preserve state for 60s when a client abruptly disconnects mid-game."""
         with self.game_state_lock:
-            if disconnected_player not in self.client_sockets:
+            if self.client_sockets.get(disconnected_player) is not dead_sock:
                 return
 
             if self.state in ("WAITING_FOR_PLAYERS", "LOBBY_WAIT"):
                 self.cleanup_session()
                 return
 
-            self.state = "FORFEIT"
-            print(f"[FSM] State -> {self.state} ('{disconnected_player}' left)")
+            self.disconnected_players.add(disconnected_player)
+            try:
+                dead_sock.close()
+            except OSError:
+                pass
+            self.client_sockets[disconnected_player] = None
 
-            remaining_players = [
-                p for p in self.player_order if p != disconnected_player
-            ]
-            winner = remaining_players[0] if remaining_players else "None"
-            final_scores = {
-                p: self.scorecards.get(p, {}).get("total", 0)
-                for p in self.player_order
-            }
+            self.state = "TEMPORARILY_DISCONNECTED"
+            print(f"[FSM] State -> {self.state} ('{disconnected_player}' dropped)")
+            print(
+                f"[STATE PRESERVED] Holding game state & scores in memory. "
+                f"Starting {RECONNECT_GRACE_SECONDS}s reconnect grace timer for '{disconnected_player}'."
+            )
 
-            self.state = "GAME_OVER"
-            print(f"[FSM] State -> {self.state} (Winner by forfeit: {winner})")
+            notice = (
+                f"{disconnected_player} disconnected. "
+                f"Waiting {RECONNECT_GRACE_SECONDS}s for reconnect..."
+            )
+            self.broadcast(self.build_state_update(status_message=notice))
 
-            for pid, sock in list(self.client_sockets.items()):
-                if pid != disconnected_player:
-                    try:
-                        send_msg(sock, {
-                            "msg_type": "GAME_OVER",
-                            "winner": winner,
-                            "final_scores": final_scores,
-                            "reason": "forfeit"
-                        })
-                    except OSError:
-                        pass
+            timer = threading.Timer(
+                RECONNECT_GRACE_SECONDS,
+                self.handle_grace_timeout,
+                args=(disconnected_player,)
+            )
+            timer.daemon = True
+            self.reconnect_timers[disconnected_player] = timer
+            timer.start()
 
-            self.cleanup_session()
+    def handle_grace_timeout(self, disconnected_player):
+        """Declare forfeit only if the 60s grace period expires without reconnect."""
+        with self.game_state_lock:
+            if disconnected_player not in self.disconnected_players:
+                return
+            print(f"[TIMEOUT] Reconnect grace timer expired for '{disconnected_player}'.")
+            self._declare_forfeit_locked(disconnected_player)
+
+    def handle_forfeit(self, disconnected_player):
+        """Handle explicit 'quit' DISCONNECT message."""
+        with self.game_state_lock:
+            if disconnected_player not in self.client_sockets:
+                return
+            if self.state in ("WAITING_FOR_PLAYERS", "LOBBY_WAIT"):
+                self.cleanup_session()
+                return
+            self._declare_forfeit_locked(disconnected_player)
+
+    def _declare_forfeit_locked(self, disconnected_player):
+        """Internal helper to broadcast forfeit GAME_OVER (caller holds lock)."""
+        self.state = "FORFEIT"
+        print(f"[FSM] State -> {self.state} ('{disconnected_player}' forfeited)")
+
+        remaining_players = [
+            p for p in self.player_order if p != disconnected_player
+        ]
+        winner = remaining_players[0] if remaining_players else "None"
+        final_scores = {
+            p: self.scorecards.get(p, {}).get("total", 0)
+            for p in self.player_order
+        }
+
+        self.state = "GAME_OVER"
+        print(f"[FSM] State -> {self.state} (Winner by forfeit: {winner})")
+
+        self.broadcast({
+            "msg_type": "GAME_OVER",
+            "winner": winner,
+            "final_scores": final_scores,
+            "reason": "forfeit"
+        })
+        self.cleanup_session()
 
     def cleanup_session(self):
         """Close active client sockets and reset server state (caller holds lock)."""
         self.state = "CLEANUP"
         print(f"[FSM] State -> {self.state}")
         for sock in self.client_sockets.values():
-            try:
-                sock.close()
-            except OSError:
-                pass
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
         self.reset_game_state()
 
     def start(self):
